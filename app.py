@@ -1,114 +1,207 @@
 import os
+import re
 import tempfile
+from pathlib import Path
 from urllib.parse import urlparse
+from typing import Optional
 
+import yt_dlp
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-import yt_dlp
 
 app = FastAPI(title="Vidora Media Engine")
 
-# Testing default. Before public launch, restrict this to your Vidora website origin.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-ALLOWED_HOSTS = ("facebook.com", "fb.watch", "instagram.com")
+ALLOWED_HOSTS = {
+    "facebook.com",
+    "www.facebook.com",
+    "m.facebook.com",
+    "fb.watch",
+    "instagram.com",
+    "www.instagram.com",
+}
 
 
-def validate_url(url: str):
-    parsed = urlparse(url)
+def validate_url(url: str) -> str:
+    parsed = urlparse(url.strip())
     host = (parsed.hostname or "").lower()
-    allowed = any(host == domain or host.endswith("." + domain) for domain in ALLOWED_HOSTS)
-    if parsed.scheme not in ("http", "https") or not allowed:
+
+    if parsed.scheme not in ("http", "https") or host not in ALLOWED_HOSTS:
         raise HTTPException(
             status_code=400,
-            detail="الرابط غير مدعوم. استخدم رابطاً عاماً من فيسبوك أو إنستجرام."
+            detail="الرابط غير مدعوم. استخدم رابط فيديو عام من Facebook أو Instagram.",
         )
+    return url.strip()
+
+
+def ydl_options(**extra):
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "ignoreerrors": False,
+        "socket_timeout": 30,
+    }
+    options.update(extra)
+    return options
 
 
 @app.get("/")
-def root():
+def home():
     return {"service": "Vidora Media Engine", "status": "running"}
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "service": "Vidora Media Engine"}
+    return {"status": "ok"}
 
 
 @app.get("/api/info")
-def info(url: str = Query(...)):
-    validate_url(url)
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-    }
+def video_info(url: str = Query(..., min_length=8)):
+    url = validate_url(url)
+
     try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            data = ydl.extract_info(url, download=False)
+        with yt_dlp.YoutubeDL(ydl_options()) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        if not info:
+            raise ValueError("No video information returned")
 
         formats = []
-        for item in data.get("formats", []):
-            if item.get("url") and item.get("vcodec") != "none":
-                formats.append({
-                    "format_id": item.get("format_id"),
-                    "ext": item.get("ext"),
-                    "height": item.get("height"),
-                    "filesize": item.get("filesize") or item.get("filesize_approx"),
-                    "format_note": item.get("format_note"),
-                })
+        for item in info.get("formats", []):
+            height = item.get("height")
+            format_id = item.get("format_id")
+
+            if not format_id or not height:
+                continue
+
+            formats.append({
+                "format_id": str(format_id),
+                "height": int(height),
+                "ext": item.get("ext"),
+                "vcodec": item.get("vcodec"),
+                "acodec": item.get("acodec"),
+                "filesize": item.get("filesize") or item.get("filesize_approx"),
+            })
+
+        seen = set()
+        unique_formats = []
+
+        for item in formats:
+            if item["format_id"] not in seen:
+                seen.add(item["format_id"])
+                unique_formats.append(item)
 
         return {
-            "title": data.get("title"),
-            "thumbnail": data.get("thumbnail"),
-            "duration": data.get("duration"),
-            "formats": formats,
+            "title": info.get("title") or "Vidora video",
+            "thumbnail": info.get("thumbnail"),
+            "duration": info.get("duration"),
+            "formats": unique_formats,
         }
+
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"تعذر فحص الفيديو: {str(exc)[:300]}")
+        raise HTTPException(
+            status_code=422,
+            detail="تعذر فحص الفيديو. تأكد أن الرابط عام ويمكن الوصول إليه، ثم حاول مرة أخرى.",
+        ) from exc
 
 
 @app.get("/api/download")
-def download(url: str = Query(...), format_id: str = Query("best")):
-    validate_url(url)
-    temp_dir = tempfile.mkdtemp(prefix="vidora_")
-    output_template = os.path.join(temp_dir, "video.%(ext)s")
+def download_video(
+    url: str = Query(..., min_length=8),
+    format_id: Optional[str] = Query(default=None),
+):
+    url = validate_url(url)
 
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "format": format_id if format_id != "best" else "best",
-        "outtmpl": output_template,
-        "merge_output_format": "mp4",
-    }
+    if format_id and not re.fullmatch(r"[A-Za-z0-9._-]+", format_id):
+        raise HTTPException(
+            status_code=400,
+            detail="صيغة الجودة غير صالحة."
+        )
+
+    temp_dir = tempfile.mkdtemp(prefix="vidora_")
+    output_template = str(Path(temp_dir) / "vidora_video.%(ext)s")
 
     try:
+        with yt_dlp.YoutubeDL(ydl_options()) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        if not info:
+            raise ValueError("Video not found")
+
+        chosen = None
+
+        if format_id:
+            chosen = next(
+                (
+                    f for f in info.get("formats", [])
+                    if str(f.get("format_id")) == str(format_id)
+                ),
+                None,
+            )
+
+        if format_id and not chosen:
+            raise HTTPException(
+                status_code=404,
+                detail="الجودة المختارة لم تعد متاحة. افحص الرابط واختر الجودة مرة أخرى.",
+            )
+
+        if chosen:
+            has_audio = chosen.get("acodec") not in (None, "none")
+
+            if has_audio:
+                format_selector = str(format_id)
+            else:
+                format_selector = f"{format_id}+bestaudio"
+        else:
+            format_selector = "bestvideo+bestaudio/best"
+
+        options = ydl_options(
+            format=format_selector,
+            outtmpl=output_template,
+            merge_output_format="mp4",
+        )
+
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([url])
 
-        created = [
-            os.path.join(temp_dir, name)
-            for name in os.listdir(temp_dir)
-            if os.path.isfile(os.path.join(temp_dir, name))
+        files = [
+            p for p in Path(temp_dir).iterdir()
+            if p.is_file() and p.stat().st_size > 0
         ]
-        if not created:
-            raise RuntimeError("لم يتم إنشاء ملف فيديو")
 
-        path = created[0]
-        return FileResponse(
-            path,
-            filename="vidora-video" + os.path.splitext(path)[1],
-            media_type="application/octet-stream",
-            background=None,
+        if not files:
+            raise FileNotFoundError("Downloaded file was not created")
+
+        result_file = max(files, key=lambda p: p.stat().st_size)
+
+        safe_name = re.sub(
+            r'[\\/:*?"<>|]+',
+            "_",
+            info.get("title") or "Vidora_video"
         )
+        safe_name = safe_name.strip()[:100] or "Vidora_video"
+
+        return FileResponse(
+            path=str(result_file),
+            media_type="video/mp4",
+            filename=f"{safe_name}.mp4",
+        )
+
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"تعذر تنزيل الفيديو: {str(exc)[:300]}")
+        raise HTTPException(
+            status_code=422,
+            detail="فشل تنزيل الفيديو أو دمج الصوت. قد تكون الجودة غير متاحة أو يحتاج yt-dlp إلى تحديث.",
+        ) from exc
