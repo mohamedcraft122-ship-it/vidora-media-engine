@@ -1,0 +1,1 @@
+fastapi==0.115.6\nuvicorn[standard]==0.34.0\nyt-dlp>=2025.1.15\n
